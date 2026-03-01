@@ -1,0 +1,216 @@
+% =========================================================================
+% ALGORITHM 2: RP-UEIS Method for PZT Disk Parameter Determination
+% =========================================================================
+% Description: This script performs a sequential, 3-stage inverse 
+% optimization to extract the complex electromechanical parameters of a PZT 
+% transducer using Ultrasound Electrical Impedance Spectroscopy (UEIS).
+% Dependencies: COMSOL Multiphysics 6.1a with LiveLink for MATLAB.
+% =========================================================================
+clear all; clc;
+
+% --- START REAL TIME TRACKER ---
+global_start_time = tic; % Inicia el temporizador global
+total_pause_time = 0;    % Inicializa el acumulador de pausas en 0
+% -------------------------------
+
+%% 1. Initialization and Data Loading
+disp('--- Initialization and Data Loading ---');
+% Load the axisymmetric FEM model of the isolated PZT disc
+model_path = fullfile('..', 'models', 'piezoelectric_Disc');
+model = mphload(model_path);
+
+% Load experimental impedance data
+% Format expected: Column 1 = Frequency (Hz), Column 2 = Z (Ohms), Column 3 = Phase (rad)
+exp_path = fullfile('..', 'data', 'experimental_impedance_PZT.mat');
+load(exp_path);
+f_exp = data_exp(:,1);
+Z_exp = data_exp(:,2); % Complex impedance
+phi_exp = data_exp(:,3);
+
+% Derive magnitude and admittance for different cost function metrics
+Z_exp_mag = abs(Z_exp);
+Y_exp_mag = abs(1 ./ Z_exp); % Admittance is preferred for evaluating losses (Stage C)
+
+% point of minimum impedance magnitude of the PZT Ceramic.
+[~, idx_min] = min(Z_exp_mag);
+f0 = f_exp(idx_min);
+%% 2. Nominal Parameters Initialization (theta_0)
+% Manufacturer baseline values used as the starting point for optimization.
+% theta_0 order: [C11', C12', C13', C33', C44', e15', e31', e33', eps11', eps33']
+theta_0 = [1.38999e11, 7.78366e10, 7.42836e10, 1.15412e11, 2.5641e10, ... % Real Stiffness (Pa)
+           12.718, -5.200, 15.080, ...                                    % Piezoelectric (C/m^2)
+           762.5, 663.2];                                                 % Relative Permittivity
+
+% Grouping parameters based on the Sensitivity Analysis (Table 3 of the paper):
+% -------------------------------------------------------------------------
+% theta_A: Highly sensitive real mechanical properties (To be optimized)
+theta_A = [theta_0(1), theta_0(3:5)]; % [C11', C13', C33', C44']
+
+% theta_B: Highly sensitive real piezo/dielectric properties (To be optimized)
+theta_B = [theta_0(6), theta_0(8), theta_0(10)]; % [e15', e33', eps33']
+
+% theta_C: Imaginary losses (To be optimized). 
+% Initialized empirically as 0.1% of their corresponding real parts.
+% Note: C13'' is initialized negatively based on physical constraints.
+theta_C = [theta_0(1), -1.*theta_0(3), theta_0(4)] .* 0.001; % [C11'', C13'', C33'']
+
+% theta_Fixed: Insensitive parameters kept at nominal values
+theta_Fixed = [theta_0(2), theta_0(7), theta_0(9)]; % [C12', e31', eps11']
+
+% Known geometric and macroscopic properties
+h = 2.02; % PZT thickness [mm]
+rho_PZT = 7862; % PZT density [kg/m^3]
+
+%% 3. Sequential Inverse Optimization (RP-UEIS)
+% The algorithm iterates through subsets A, B, and C until global convergence.
+deltas = [0.03, 0.13]; % Array of fractional bandwidths
+Fre_step = 2000; % Frequency resolution step for FEM simulations [Hz]
+
+% Reset loop control variables for the current bandwidth
+err = 1.0; 
+C_ref = 1;
+iter = 1;
+i=1;
+
+while err >= 0.05 % 5% relative error convergence criterion
+
+     
+
+    if iter==1
+       delta = deltas(1);
+
+    else
+        delta = deltas(2);
+    end
+
+    fprintf('\n=======================================\n');
+    fprintf('--- Global Iteration %d (Delta: %.2f) ---\n', iter, delta);
+    fprintf('=======================================\n');
+    disp('Starting RP-UEIS optimization in stages...');
+
+    % --- Resonance Identification and Frequency Windowing ---
+    % Custom function to extract the relevant data subset dynamically
+    [f_window, Z_window, Y_window, phi_window] = window_frequency(f_exp, Z_exp_mag, Y_exp_mag, phi_exp,f0, delta);
+
+    % -----------------------------------------------------------------
+    % STAGE A: Real Elastic Parameters 
+    % Metric: Logarithmic Impedance (log|Z|)
+    % -----------------------------------------------------------------
+    disp('>> Stage A: Optimizing C11'', C13'', C33'', C44''...');
+    cost_A = @(p) cost_function_Z_PZT(p, theta_B, theta_C, theta_Fixed, ...
+                                  model, f_window, Z_window, phi_window, ...
+                                  Fre_step, h, rho_PZT);
+    options_A = optimset('Display','iter', 'MaxFunEvals',1e3, 'MaxIter',80, 'TolX',1e-3, 'TolFun',1e-3);
+    theta_A = fminsearch(cost_A, theta_A, options_A); % Update theta_A
+    
+    % -----------------------------------------------------------------
+    % STAGE B: Real Piezoelectric and Dielectric Parameters
+    % Metric: Logarithmic Impedance (log|Z|)
+    % -----------------------------------------------------------------
+    disp('>> Stage B: Optimizing e15'', e33'', eps33''...');
+    cost_B = @(p) cost_function_Z_PZT(theta_A, p, theta_C, theta_Fixed, ...
+                                  model, f_window, Z_window, phi_window, ...
+                                  Fre_step, h, rho_PZT);
+    options_B = optimset('Display','iter', 'MaxFunEvals',1e3, 'MaxIter',80, 'TolX',1e-3, 'TolFun',1e-3);
+    theta_B = fminsearch(cost_B, theta_B, options_B); % Update theta_B
+   
+    % -----------------------------------------------------------------
+    % STAGE C: Imaginary Parameters (Mechanical Losses)
+    % Metric: Linear Admittance (|Y|)
+    % Constraints: Thermodynamic passivity
+    % -----------------------------------------------------------------
+    disp('>> Stage C: Optimizing losses C11'''', C13'''', C33'''' with constraints...');
+    cost_C = @(p) cost_function_Y_PZT(theta_A, theta_B, p, theta_Fixed, ...
+                                  model, f_window, Z_window, phi_window, ...
+                                  Fre_step, h, rho_PZT);
+                                  
+    % Passivity constraint enforcing positive power dissipation (Eq. 12)
+    nonlcon_passivity = @(x) sqrt( (x(1)-x(3))^2 + 8*(x(2))^2 ) - (x(1)+x(3));
+    
+    % Lower bounds: Loss components must be strictly positive (or zero)
+    lb_C = [0, -inf, 0]; 
+    ub_C = [inf, inf, inf];
+    options_C = optimset('Display','iter', 'MaxFunEvals',1e3, 'MaxIter',50, 'TolX',1e-3, 'TolFun',1e-3);
+    
+    % Optimize subject to constraints using fminsearchcon
+    theta_C = fminsearchcon(cost_C, theta_C, lb_C, ub_C, [], [], nonlcon_passivity, options_C); % Update theta_C
+    
+    % -----------------------------------------------------------------
+    % Global Convergence Check
+    % -----------------------------------------------------------------
+    C_current = cost_function_Z_PZT(theta_A, theta_B, theta_C, theta_Fixed, ...
+                                 model, f_window, Z_window, phi_window, ...
+                                 Fre_step, h, rho_PZT);
+    
+    err = abs(C_current - C_ref) / abs(C_ref); % Calculate relative error jump
+    C_ref = C_current; % Update reference for next iteration
+    
+    fprintf('\n=> End of Iteration %d. Current Cost: %.4f | Relative Error: %.2f%%\n', iter, C_current, err*100);
+    iter = iter + 1;
+    
+    % -----------------------------------------------------------------
+    % Tracker de Pausa (Mide el tiempo exacto que pasa en pausa)
+    % -----------------------------------------------------------------
+    disp('Cooling down CPU for 500 seconds...');
+    pause_start = tic; % Inicia timer de esta pausa especifica
+    pause(500); 
+    actual_pause = toc(pause_start); % Detiene timer de la pausa
+    total_pause_time = total_pause_time + actual_pause; % Acumula el tiempo pausado
+        
+ end
+%% 4. Assembly and Export of Final Parameters
+% Reassemble the scattered optimized subsets back into a single, cohesive 
+% parameter vector for easy reporting and future simulation setups.
+% -------------------------------------------------------------------------
+theta = zeros(1, 13); % Preallocate memory (10 Real + 3 Imaginary)
+
+% --- Real Parts (Mechanical) ---
+theta(1) = theta_A(1);       % C11'
+theta(2) = theta_Fixed(1);   % C12' (Fixed)
+theta(3:5) = theta_A(2:4);   % C13', C33', C44'
+
+% --- Real Parts (Piezoelectric and Dielectric) ---
+theta(6) = theta_B(1);       % e15'
+theta(7) = theta_Fixed(2);   % e31' (Fixed)
+theta(8) = theta_B(2);       % e33'
+theta(9) = theta_Fixed(3);   % eps11' (Fixed)
+theta(10) = theta_B(3);      % eps33'
+
+% --- Imaginary Parts (Mechanical Losses) ---
+theta(11:13) = theta_C(1:3); % C11'', C13'', C33''
+
+disp('Optimization complete. Saving final parameter vector "theta.mat"...');
+
+% 1. Define the relative path to the 'data' folder using '..'
+data_folder = fullfile('..', 'data');
+
+% 2. Create the 'data' folder if it does not exist
+if ~exist(data_folder, 'dir')
+    mkdir(data_folder);
+end
+
+% 3. Build the full path for the output file
+theta_file = fullfile(data_folder, 'theta.mat');
+
+% 4. Save the 'theta' variable exactly at that path
+save(theta_file, 'theta');
+
+disp('Done! theta.mat saved successfully in the ../data folder.');
+
+%% --- COMPUTE FINAL EXECUTION TIME ---
+total_elapsed_time = toc(global_start_time); % Tiempo total desde que inicio el script
+real_execution_time = total_elapsed_time - total_pause_time; % Restando el tiempo en "pause"
+
+% Convertir a formato legible (Horas:Minutos:Segundos)
+hours = floor(real_execution_time / 3600);
+minutes = floor(mod(real_execution_time, 3600) / 60);
+seconds = mod(real_execution_time, 60);
+
+fprintf('\n=======================================\n');
+fprintf('         EXECUTION TIME SUMMARY        \n');
+fprintf('=======================================\n');
+fprintf('Total Elapsed Time (with pauses): %.2f seconds\n', total_elapsed_time);
+fprintf('Total Pause Time Deducted       : %.2f seconds\n', total_pause_time);
+fprintf('---------------------------------------\n');
+fprintf('REAL COMPUTATION TIME           : %02d:%02d:%05.2f (HH:MM:SS)\n', hours, minutes, seconds);
+fprintf('=======================================\n');

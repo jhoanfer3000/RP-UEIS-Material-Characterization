@@ -1,0 +1,237 @@
+% =========================================================================
+% ALGORITHM 3: RP-UEIS Method for Tested Material Parameter Determination
+% =========================================================================
+% Description: This script performs the final inverse optimization stage to 
+% extract the complex viscoelastic parameters (Bulk Modulus K and Shear 
+% Modulus G) of a tested material (e.g., PLA) coupled to a characterized 
+% PZT transducer via a coupling gel layer.
+% Dependencies: COMSOL Multiphysics 6.1a with LiveLink for MATLAB.
+% Custom functions: 'window_frequency', 'cost_function_Y', 'fminsearchcon'
+% =========================================================================
+
+clear all; clc;
+
+% --- START REAL TIME TRACKER ---
+% We track execution time and deduct pauses to report pure computation time
+global_start_time = tic;
+total_pause_time = 0;    
+% -------------------------------
+
+%% 1. Initialization and Experimental Data Loading
+disp('--- Initialization and Data Loading ---');
+
+% Load the axisymmetric FEM model of the RP-UEIS assembly
+% Note: The model should be pre-compiled in COMSOL
+model_path = fullfile('..', 'models', 'Piezoelectric_Disc_plus_Material');
+model = mphload(model_path);
+
+% Load experimental impedance data of the COUPLED system (PZT + Gel + Material)
+% Expected format in .mat: Column 1 = Freq (Hz), Col 2 = Z (Ohms), Col 3 = Phase (rad)
+exp_path = fullfile('..', 'data', 'experimental_impedance_PZT_plus_PLA.mat');
+load(exp_path);
+f_exp = data_exp(:,1);
+Z_exp = data_exp(:,2);   
+phi_exp = data_exp(:,3); 
+
+% Derive magnitude and admittance metrics
+Z_exp_mag = abs(Z_exp);
+Y_exp_mag = abs(1 ./ Z_exp); % Admittance is highly sensitive to mechanical losses
+
+%% 2. Resonance Identification and Frequency Windowing
+% Define a narrow frequency window around the fundamental resonance peak.
+% This focuses the optimization on the spectral region containing the most
+% information about the electromechanical coupling and losses, avoiding noise.
+delta = 0.13; % Fractional bandwidth (+/- 10% around resonance)
+%Resonance Identification
+% The series resonance frequency (f0) physically corresponds to the 
+% point of minimum impedance magnitude of the PZT Ceramic.
+exp_path = fullfile('..', 'data', 'experimental_impedance_PZT.mat');
+load(exp_path);
+Z_exp_mag_PZT=Z_exp;
+
+[~, idx_min] = min(Z_exp_mag_PZT);
+f0 = f_exp(idx_min);
+[f_window, Z_window, Y_window, phi_window] = window_frequency(f_exp, Z_exp_mag, Y_exp_mag, phi_exp,f0, delta);
+
+%% 3. Load Base Parameters and Set Initial Guesses
+% Load the previously optimized PZT parameters (from Algorithm 2)
+% theta order: [C11', C12', C13', C33', C44', e15', e31', e33', eps11', eps33', C11'', C13'', C33'']
+theta_path = fullfile('..', 'data', 'theta.mat');
+load(theta_path );
+
+% --- Tested Material Properties (e.g., 3D-Printed PLA) ---
+d_ma = 25;       % Diameter of the tested material sample [mm]
+th_ma = 1.05;    % Thickness of the tested material sample [mm]
+rho_ma = 1131.7; % Density of the tested material [kg/m^3]
+
+% --- Initial Guesses (Seeds) for Optimization ---
+% Complex Bulk Modulus (K) and Shear Modulus (G) [Pa]
+Kma = 2.8e9 + 1i*2e8;
+Gma = 1.14e9 + 1i*7e7;
+
+% Parameter vector for the optimizer: [K', G', K'', G'']
+% Real parts (Storage) first, followed by Imaginary parts (Losses)
+theta_s = [real(Kma), real(Gma), imag(Kma), imag(Gma)]; 
+
+% --- Coupling Gel Properties ---
+d = 20;          % Thickness of the coupling gel layer [um]
+rho_Gel = 1020;  % Density of the coupling gel [kg/m^3]
+c_Gel = 1500;    % Speed of sound in the coupling gel [m/s]
+
+% --- Known PZT Disk Properties ---
+h = 2.02;        % Thickness of the characterized PZT transducer [mm]
+rho_PZT = 7862;  % Density of the PZT transducer [kg/m^3]
+
+%% 4. RP-UEIS Inverse Optimization (Tested Material)
+Fre_step = 2000; % Frequency resolution step for FEM simulations [Hz]
+
+% Loop control variables for global convergence
+err = 1.0;       % Initial simulated error
+C_ref = 1;       % Reference cost for relative jump calculation
+iter = 1;        % Iteration counter
+
+% Iterate until the relative change in the cost function is less than 5%
+while err >= 0.05 
+    fprintf('\n=======================================\n');
+    fprintf('--- Global Iteration %d (Delta: %.2f) ---\n', iter, delta);
+    fprintf('=======================================\n');
+    disp('Starting coupled material optimization...');
+    
+    % Define the objective cost function handle
+    % It calculates the difference between Exp and FEM admittance spectra
+    cost_B = @(p) cost_function_Y_Material(p, theta, model, f_window, Z_window, ...
+                                  phi_window, Fre_step, h, rho_PZT, d_ma, ...
+                                  th_ma, rho_ma, d, rho_Gel, c_Gel);
+                                  
+    % Search space bounds for [K', G', K'', G''] to prevent non-physical negative values
+    LB_B = [1e5, 1e5, 1e5, 1e5];
+    UB_B = [1e10, 1e10, 1e10, 1e10];
+    
+    nonlcon = @(x) physical_constraints(x, rho_ma);
+    
+    % Optimizer configuration: TolX and TolFun set termination tolerances
+    options_B = optimset('Display','iter', 'MaxFunEvals',1e3, 'MaxIter',80, 'TolX',1e-3, 'TolFun',1e-3);
+    
+    % Run constrained Nelder-Mead simplex optimization
+    theta_s = fminsearchcon(cost_B, theta_s, LB_B, UB_B, [], [], nonlcon, options_B);
+   
+    % --- Global Convergence Check ---
+    % Evaluate cost function with the newly updated theta_s
+    C_current = cost_function_Y_Material(theta_s, theta, model, f_window, Z_window, ...
+                                  phi_window, Fre_step, h, rho_PZT, d_ma, ...
+                                  th_ma, rho_ma, d, rho_Gel, c_Gel);
+    
+    % Calculate relative error jump to check if the algorithm has plateaued
+    err = abs(C_current - C_ref) / abs(C_ref); 
+    C_ref = C_current; % Update reference for next iteration
+    
+    fprintf('\n=> End of Iteration %d. Current Cost: %.4f | Relative Error: %.2f%%\n', iter, C_current, err*100);
+    iter = iter + 1;
+    
+    % --- CPU Cool-down Tracker ---
+    % COMSOL LiveLink can overheat the CPU during heavy loops. 
+    disp('Cooling down CPU for 500 seconds...');
+    pause_start = tic; 
+    pause(500); % Uncomment to enable actual pause
+    total_pause_time = total_pause_time + toc(pause_start); 
+end
+
+%% 5. Assembly and Export of Final Parameters
+disp('Optimization complete. Saving final tested material parameters "theta_s.mat"...');
+
+% 1. Define the relative path to the 'data' folder using '..'
+data_folder = fullfile('..', 'data');
+
+% 2. Create the 'data' folder if it does not exist
+if ~exist(data_folder, 'dir')
+    mkdir(data_folder);
+end
+
+% 3. Build the full path for the output file
+theta_s_file = fullfile(data_folder, 'theta_s.mat');
+
+% 4. Save the 'theta_s' variable exactly at that path
+save(theta_s_file, 'theta_s'); % Save workspace variable to load in future analyses
+
+disp('Done! theta_s.mat saved successfully in the ../data folder.');
+
+
+%% --- COMPUTE FINAL EXECUTION TIME ---
+% Computes real calculation time by deducting the intentional thermal pauses
+total_elapsed_time = toc(global_start_time); 
+real_execution_time = total_elapsed_time - total_pause_time; 
+
+hours = floor(real_execution_time / 3600);
+minutes = floor(mod(real_execution_time, 3600) / 60);
+seconds = mod(real_execution_time, 60);
+
+fprintf('\n=======================================\n');
+fprintf('         EXECUTION TIME SUMMARY        \n');
+fprintf('=======================================\n');
+fprintf('Total Elapsed Time (with pauses): %.2f seconds\n', total_elapsed_time);
+fprintf('Total Pause Time Deducted       : %.2f seconds\n', total_pause_time);
+fprintf('---------------------------------------\n');
+fprintf('REAL COMPUTATION TIME           : %02d:%02d:%05.2f (HH:MM:SS)\n', hours, minutes, seconds);
+fprintf('=======================================\n');
+
+%% 6. CALCULATE AND DISPLAY DERIVED MATERIAL PROPERTIES
+% Transforms the optimized Bulk and Shear moduli into standard engineering 
+% properties commonly reported in acoustic and materials science literature.
+
+disp(' ');
+disp('=======================================================');
+disp('      DERIVED MATERIAL PROPERTIES (TESTED MATERIAL)    ');
+disp('=======================================================');
+
+% Reconstruct complex moduli from the optimized vector
+% theta_s = [K_real, G_real, K_imag, G_imag]
+K_complex = theta_s(1) + 1i * theta_s(3);
+G_complex = theta_s(2) + 1i * theta_s(4);
+
+% 1. Density (rho_s)
+rho_s = rho_ma; 
+
+% 2. Longitudinal Modulus (L)
+L_complex = K_complex + (4/3)*G_complex;
+
+% 3. Young's Modulus (E)
+E_complex = (9 * K_complex * G_complex) / (3 * K_complex + G_complex);
+
+% 4. Poisson's ratio (v)
+v_complex = (3 * K_complex - 2 * G_complex) / (2 * (3 * K_complex + G_complex));
+
+% 5. Tangent losses (tan delta) representing internal friction
+tan_delta_l = imag(L_complex) / real(L_complex);
+tan_delta_s = imag(G_complex) / real(G_complex);
+
+% 6. Sound speeds (Phase velocities)
+c_l = sqrt(real(L_complex) / rho_s);
+c_s = sqrt(real(G_complex) / rho_s);
+
+% 7. Absorption coefficients (alpha) evaluated at the fundamental resonance
+% Find the resonance frequency (f0) from experimental impedance minimum
+[~, idx_min] = min(Z_exp_mag);
+f0 = f_exp(idx_min); 
+omega = 2 * pi * f0; % Angular frequency
+
+% Calculate spatial absorption in Nepers/meter (Np/m)
+alpha_l_Np = (omega / (2 * c_l)) * tan_delta_l;
+alpha_s_Np = (omega / (2 * c_s)) * tan_delta_s;
+
+% Convert absorption from Nepers to Decibels/meter (1 Np ≈ 8.686 dB)
+alpha_l_dB = alpha_l_Np * 8.6858896;
+alpha_s_dB = alpha_s_Np * 8.6858896;
+
+% --- DISPLAY RESULTS IN COMMAND WINDOW ---
+fprintf('Density (rho_s): \t\t%.2f [kg/m^3]\n', rho_s);
+fprintf('Young''s Modulus (E):\t\t%.2e + %.2ei [Pa]\n', real(E_complex), imag(E_complex));
+fprintf('Poisson''s Ratio (v):\t\t%.4f + %.4fi\n', real(v_complex), imag(v_complex));
+fprintf('Bulk Modulus (K):\t\t%.2e + %.2ei [Pa]\n', real(K_complex), imag(K_complex));
+fprintf('Shear Modulus (G):\t\t%.2e + %.2ei [Pa]\n', real(G_complex), imag(G_complex));
+fprintf('Long. Sound Speed (c_l):\t%.2f [m/s]\n', c_l);
+fprintf('Shear Sound Speed (c_s):\t%.2f [m/s]\n', c_s);
+fprintf('Long. Tangent Loss (tan d_l):\t%.4e\n', tan_delta_l);
+fprintf('Shear Tangent Loss (tan d_s):\t%.4e\n', tan_delta_s);
+fprintf('Long. Absorption (a_l):\t\t%.2f [Np/m] | %.2f [dB/m] (at %.2f kHz)\n', alpha_l_Np, alpha_l_dB, f0/1000);
+fprintf('Shear Absorption (a_s):\t\t%.2f [Np/m] | %.2f [dB/m] (at %.2f kHz)\n', alpha_s_Np, alpha_s_dB, f0/1000);
+disp('=======================================================');
