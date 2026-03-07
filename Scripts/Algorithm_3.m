@@ -3,7 +3,7 @@
 % =========================================================================
 % Description: This script performs the final inverse optimization stage to 
 % extract the complex viscoelastic parameters (Bulk Modulus K and Shear 
-% Modulus G) of a tested material (e.g., PLA) coupled to a characterized 
+% Modulus G) of a tested material (e.g., PMMA) coupled to a characterized 
 % PZT transducer via a coupling gel layer.
 % Dependencies: COMSOL Multiphysics 6.1a with LiveLink for MATLAB.
 % Custom functions: 'window_frequency', 'cost_function_Y', 'fminsearchcon'
@@ -27,7 +27,7 @@ model = mphload(model_path);
 
 % Load experimental impedance data of the COUPLED system (PZT + Gel + Material)
 % Expected format in .mat: Column 1 = Freq (Hz), Col 2 = Z (Ohms), Col 3 = Phase (rad)
-exp_path = fullfile('..', 'data', 'experimental_impedance_PZT_plus_PLA.mat');
+exp_path = fullfile('..', 'data', 'experimental_impedance_PZT_plus_PMMA.mat');
 load(exp_path);
 f_exp = data_exp(:,1);
 Z_exp = data_exp(:,2);   
@@ -41,7 +41,7 @@ Y_exp_mag = abs(1 ./ Z_exp); % Admittance is highly sensitive to mechanical loss
 % Define a narrow frequency window around the fundamental resonance peak.
 % This focuses the optimization on the spectral region containing the most
 % information about the electromechanical coupling and losses, avoiding noise.
-delta = 0.13; % Fractional bandwidth (+/- 10% around resonance)
+delta = 0.1; % Fractional bandwidth (+/- 10% around resonance)
 %Resonance Identification
 % The series resonance frequency (f0) physically corresponds to the 
 % point of minimum impedance magnitude of the PZT Ceramic.
@@ -59,15 +59,15 @@ f0 = f_exp(idx_min);
 theta_path = fullfile('..', 'data', 'theta.mat');
 load(theta_path );
 
-% --- Tested Material Properties (e.g., 3D-Printed PLA) ---
+% --- Tested Material Properties (e.g., PMMA) ---
 d_ma = 25;       % Diameter of the tested material sample [mm]
 th_ma = 1.05;    % Thickness of the tested material sample [mm]
-rho_ma = 1131.7; % Density of the tested material [kg/m^3]
+rho_ma = 1166.29; % Density of the tested material [kg/m^3] Pmma
 
 % --- Initial Guesses (Seeds) for Optimization ---
 % Complex Bulk Modulus (K) and Shear Modulus (G) [Pa]
-Kma = 2.8e9 + 1i*2e8;
-Gma = 1.14e9 + 1i*7e7;
+Kma = 5.18e9 + 1i*1.8e8; %pmma
+Gma = 1.47e9 + 1i*1.5e8; %pmma
 
 % Parameter vector for the optimizer: [K', G', K'', G'']
 % Real parts (Storage) first, followed by Imaginary parts (Losses)
@@ -107,7 +107,12 @@ while err >= 0.05
     LB_B = [1e5, 1e5, 1e5, 1e5];
     UB_B = [1e10, 1e10, 1e10, 1e10];
     
-    nonlcon = @(x) physical_constraints(x, rho_ma);
+    
+    %poisson restrictions for the e.g.PMMA
+    poisson_min=0.33;
+    poisson_max=0.41;
+
+    nonlcon = @(x) physical_constraints(x, rho_ma,poisson_min,poisson_max);
     
     % Optimizer configuration: TolX and TolFun set termination tolerances
     options_B = optimset('Display','iter', 'MaxFunEvals',1e3, 'MaxIter',80, 'TolX',1e-3, 'TolFun',1e-3);

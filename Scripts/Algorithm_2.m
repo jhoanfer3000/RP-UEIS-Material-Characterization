@@ -63,7 +63,7 @@ rho_PZT = 7862; % PZT density [kg/m^3]
 
 %% 3. Sequential Inverse Optimization (RP-UEIS)
 % The algorithm iterates through subsets A, B, and C until global convergence.
-deltas = [0.03, 0.13]; % Array of fractional bandwidths
+deltas = [0.03, 0.12]; % Array of fractional bandwidths
 Fre_step = 2000; % Frequency resolution step for FEM simulations [Hz]
 
 % Reset loop control variables for the current bandwidth
@@ -190,7 +190,7 @@ if ~exist(data_folder, 'dir')
 end
 
 % 3. Build the full path for the output file
-theta_file = fullfile(data_folder, 'theta.mat');
+theta_file = fullfile(data_folder, 'theta_04_03_2026.mat');
 
 % 4. Save the 'theta' variable exactly at that path
 save(theta_file, 'theta');
